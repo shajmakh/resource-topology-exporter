@@ -228,8 +228,8 @@ func WithNodeName(name string) func(*resourceMonitor) {
 }
 
 func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultPodResourcesTimeout)
-	defer cancel()
+	ctx := context.Background() // cancel := context.WithTimeout(context.Background(), defaultPodResourcesTimeout)
+	//	defer cancel()
 	resp, err := rm.podResCli.List(ctx, &podresourcesapi.ListPodResourcesRequest{})
 	if err != nil {
 		metrics.UpdatePodResourceApiCallsFailureMetric("list")
