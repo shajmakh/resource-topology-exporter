@@ -22,6 +22,7 @@ package rte
 
 import (
 	"context"
+	"reflect"
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
@@ -37,6 +38,7 @@ import (
 
 	"github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
 	topologyclientset "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/generated/clientset/versioned"
+	"github.com/k8stopologyawareschedwg/numaplacement"
 	"github.com/k8stopologyawareschedwg/podfingerprint"
 	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/k8sannotations"
 	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/nrtupdater"
@@ -191,7 +193,7 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 			}
 
 			currNrt := e2enodetopology.GetNodeTopology(f.TopoCli, topologyUpdaterNode.Name)
-			klog.Infof("Control NRT: %q generation=%v resourceVersion=%v", prevNrt.Name, prevNrt.Generation, prevNrt.ResourceVersion)
+			klog.Infof("Current NRT: %q generation=%v resourceVersion=%v", prevNrt.Name, prevNrt.Generation, prevNrt.ResourceVersion)
 
 			// note we don't test no pods have been added/deleted. This is because the suite is supposed to own the cluster while it runs
 			// IOW, if we don't create/delete pods explicitely, noone else is supposed to do
@@ -257,6 +259,106 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 				dumpPods(f.K8SCli, topologyUpdaterNode.Name, errMessage)
 			}
 			gomega.Expect(pfpChanged).To(gomega.BeTrue(), errMessage)
+		})
+
+		ginkgo.Context("[payload][numaplacement] with reported container NUMA locality", func() {
+			ginkgo.It("should report stable values of per-zone attributes on non-changing pods", func() {
+				prevNrt := e2enodetopology.GetNodeTopology(f.TopoCli, topologyUpdaterNode.Name)
+				klog.Infof("Initial NRT: %q generation=%v resourceVersion=%v", prevNrt.Name, prevNrt.Generation, prevNrt.ResourceVersion)
+
+				if _, ok := findAttribute(prevNrt.Attributes, podfingerprint.Attribute); !ok {
+					ginkgo.Skip("pod fingerprinting attribute not found - assuming disabled")
+				}
+				metaBefore, ok := findAttribute(prevNrt.Attributes, numaplacement.AttributeMetadata)
+				if !ok {
+					ginkgo.Skip("numaplacement metadata not found - assuming container NUMA locality not supported")
+				}
+
+				dumpPods(f.K8SCli, topologyUpdaterNode.Name, "reference pods")
+
+				updateInterval, method, err := estimateUpdateInterval(*prevNrt)
+				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+				klog.Infof("%s update interval: %s", method, updateInterval)
+
+				zonesBefore := collectZoneNumaVectors(prevNrt)
+
+				maxSteps := 3
+				for step := 0; step < maxSteps; step++ {
+					klog.Infof("waiting for %s: %d/%d", updateInterval, step+1, maxSteps)
+					time.Sleep(updateInterval)
+				}
+
+				// note we don't test no pods have been added/deleted. This is because the suite is supposed to own the cluster while it runs
+				// IOW, if we don't create/delete pods explicitely, noone else is supposed to do
+				currNrt := e2enodetopology.GetNodeTopology(f.TopoCli, topologyUpdaterNode.Name)
+				klog.Infof("Current NRT: %q generation=%v resourceVersion=%v", currNrt.Name, currNrt.Generation, currNrt.ResourceVersion)
+
+				metaAfter, ok := findAttribute(currNrt.Attributes, numaplacement.AttributeMetadata)
+				gomega.Expect(ok).To(gomega.BeTrue(), "attribute %q missing after wait", numaplacement.AttributeMetadata)
+				zonesAfter := collectZoneNumaVectors(currNrt)
+
+				if metaBefore != metaAfter || !reflect.DeepEqual(zonesBefore, zonesAfter) {
+					dumpPods(f.K8SCli, topologyUpdaterNode.Name, "after per-zone numaplacement mismatch")
+					_ = dumpRTELogs(f.K8SCli, topologyUpdaterNode.Name)
+				}
+
+				gomega.Expect(metaAfter).To(gomega.Equal(metaBefore), "numaplacement metadata changed unexpectedly")
+				gomega.Expect(zonesAfter).To(gomega.Equal(zonesBefore), "per-zone %q attributes changed unexpectedly", numaplacement.AttributeVector)
+			})
+
+			ginkgo.When("pods are created and deleted", func() {
+				ginkgo.Context("PFP method is set to exclusive", func() {
+					ginkgo.BeforeEach(func() {
+						nrt := e2enodetopology.GetNodeTopology(f.TopoCli, topologyUpdaterNode.Name)
+						klog.Infof("Initial NRT: %q generation=%v resourceVersion=%v", nrt.Name, nrt.Generation, nrt.ResourceVersion)
+
+						if _, ok := findAttribute(nrt.Attributes, podfingerprint.Attribute); !ok {
+							ginkgo.Skip("pod fingerprinting attribute not found - assuming disabled")
+						}
+						meth, ok := findAttribute(nrt.Attributes, podfingerprint.AttributeMethod)
+						gomega.Expect(ok).To(gomega.BeTrue(), "attribute %q missing, but PFP reported", podfingerprint.AttributeMethod)
+						// note this is a subset of all the available methods declared in the podfingerprint package
+						if meth != podfingerprint.MethodWithExclusiveResources {
+							ginkgo.Skip("PFP computation method is not exclusive - assuming disabled")
+						}
+					})
+					ginkgo.It("should change container fingerprint if the new container requires exclusive resources", func() {
+						// TODO
+					})
+					ginkgo.It("should not change container fingerprint if the new container does not require exclusive resources", func() {
+						// TODO
+					})
+				})
+
+				ginkgo.Context("PFP method is set to All", func() {
+					ginkgo.BeforeEach(func() {
+						nrt := e2enodetopology.GetNodeTopology(f.TopoCli, topologyUpdaterNode.Name)
+						klog.Infof("Initial NRT: %q generation=%v resourceVersion=%v", nrt.Name, nrt.Generation, nrt.ResourceVersion)
+
+						if _, ok := findAttribute(nrt.Attributes, podfingerprint.Attribute); !ok {
+							ginkgo.Skip("pod fingerprinting attribute not found - assuming disabled")
+						}
+						meth, ok := findAttribute(nrt.Attributes, podfingerprint.AttributeMethod)
+						gomega.Expect(ok).To(gomega.BeTrue(), "attribute %q missing, but PFP reported", podfingerprint.AttributeMethod)
+						// note this is a subset of all the available methods declared in the podfingerprint package
+						if meth != podfingerprint.MethodWithExclusiveResources {
+							ginkgo.Skip("PFP computation method is not exclusive - assuming disabled")
+						}
+					})
+					ginkgo.DescribeTable("should change container fingerprint on new pod creation - {podClass}", func(qos corev1.PodQOSClass) {
+						// TODO
+						// pick a target node
+						// save initial NRT attributes
+						// create a pod with the given QOS class
+						// wait for the pod to be running
+						// check the container fingerprint
+					},
+						ginkgo.Entry("best effort", corev1.PodQOSBestEffort),
+						ginkgo.Entry("burstable", corev1.PodQOSBurstable),
+						ginkgo.Entry("guaranteed", corev1.PodQOSGuaranteed),
+					)
+				})
+			})
 		})
 	})
 	ginkgo.Context("with refresh-node-resources enabled", func() {
@@ -427,4 +529,14 @@ func findAttribute(attrs v1alpha2.AttributeList, name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func collectZoneNumaVectors(nrt *v1alpha2.NodeResourceTopology) map[string]string {
+	out := make(map[string]string)
+	for _, z := range nrt.Zones {
+		if v, ok := findAttribute(z.Attributes, numaplacement.AttributeVector); ok {
+			out[z.Name] = v
+		}
+	}
+	return out
 }

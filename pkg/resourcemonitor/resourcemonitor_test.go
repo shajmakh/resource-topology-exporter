@@ -18,6 +18,7 @@ package resourcemonitor
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"sort"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"google.golang.org/protobuf/testing/protocmp"
 
 	topologyv1alpha2 "github.com/k8stopologyawareschedwg/noderesourcetopology-api/pkg/apis/topology/v1alpha2"
+	"github.com/k8stopologyawareschedwg/numaplacement"
 	"github.com/k8stopologyawareschedwg/podfingerprint"
 	"github.com/k8stopologyawareschedwg/resource-topology-exporter/pkg/podres"
 )
@@ -1390,6 +1392,596 @@ func getExpectedCoreToNodeMap() map[int]int {
 		21: 1,
 		23: 1,
 	}
+}
+
+func TestEncodeContainerAffinities(t *testing.T) {
+	twoNUMANodesTopo := func() *ghwtopology.Info {
+		return &ghwtopology.Info{
+			Nodes: []*ghwtopology.Node{
+				{ID: 0},
+				{ID: 1},
+			},
+		}
+	}
+	t.Run("skips_when_topology_manager_policy_is_not_single_numa_node", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args: Args{TopologyManagerPolicy: "restricted"},
+			topo: twoNUMANodesTopo(),
+		}
+		podRes := []*podresourcesapi.PodResources{
+			{
+				Namespace: "ns",
+				Name:      "pod",
+				Containers: []*podresourcesapi.ContainerResources{
+					{Name: "c", CpuIds: []int64{0}},
+				},
+			},
+		}
+		got, err := rm.encodeContainerAffinities(podRes)
+		assert.NoError(t, err)
+		assert.Equal(t, numaplacement.Payload{}, got)
+	})
+
+	t.Run("skips_when_no_pod_resources", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args: Args{TopologyManagerPolicy: TMPolicySingleNUMANode},
+			topo: twoNUMANodesTopo(),
+		}
+		got, err := rm.encodeContainerAffinities(nil)
+		assert.NoError(t, err)
+		assert.Equal(t, numaplacement.Payload{}, got)
+
+		got, err = rm.encodeContainerAffinities([]*podresourcesapi.PodResources{})
+		assert.NoError(t, err)
+		assert.Equal(t, numaplacement.Payload{}, got)
+	})
+
+	t.Run("new_encoder_fails_when_topology_has_zero_numa_nodes", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args: Args{TopologyManagerPolicy: TMPolicySingleNUMANode},
+			topo: &ghwtopology.Info{Nodes: []*ghwtopology.Node{}},
+		}
+		podRes := []*podresourcesapi.PodResources{
+			{
+				Namespace: "ns",
+				Name:      "pod",
+				Containers: []*podresourcesapi.ContainerResources{
+					{Name: "c", CpuIds: []int64{0}},
+				},
+			},
+		}
+		_, err := rm.encodeContainerAffinities(podRes)
+		assert.Error(t, err)
+		assert.True(t, errors.Is(err, numaplacement.ErrInconsistentNUMANodes))
+	})
+
+	t.Run("skips_containers_that_do_not_pass_verify", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args:              Args{TopologyManagerPolicy: TMPolicySingleNUMANode},
+			topo:              twoNUMANodesTopo(),
+			coreIDToNodeIDMap: map[int]int{0: 0},
+		}
+		podRes := []*podresourcesapi.PodResources{
+			{
+				Namespace: "ns",
+				Name:      "pod",
+				Containers: []*podresourcesapi.ContainerResources{
+					{Name: "empty"},
+				},
+			},
+		}
+		got, err := rm.encodeContainerAffinities(podRes)
+		assert.NoError(t, err)
+		want := numaplacement.Payload{
+			Containers:     0,
+			NUMANodes:      2,
+			BusiestNode:    0,
+			VectorEncoding: numaplacement.VectorEncodingLEB89,
+			Vectors:        map[int]string{},
+		}
+		assert.Empty(t, cmp.Diff(want, got))
+	})
+
+	t.Run("skips_when_find_numa_placement_errors", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args:              Args{TopologyManagerPolicy: TMPolicySingleNUMANode},
+			topo:              twoNUMANodesTopo(),
+			coreIDToNodeIDMap: map[int]int{}, // CPU 0 not mapped -> error path
+		}
+		podRes := []*podresourcesapi.PodResources{
+			{
+				Namespace: "ns",
+				Name:      "pod",
+				Containers: []*podresourcesapi.ContainerResources{
+					{Name: "c", CpuIds: []int64{0}},
+				},
+			},
+		}
+		got, err := rm.encodeContainerAffinities(podRes)
+		assert.NoError(t, err)
+		want := numaplacement.Payload{
+			Containers:     0,
+			NUMANodes:      2,
+			BusiestNode:    0,
+			VectorEncoding: numaplacement.VectorEncodingLEB89,
+			Vectors:        map[int]string{},
+		}
+		assert.Empty(t, cmp.Diff(want, got))
+	})
+
+	t.Run("single_numa_topology_short_circuits_without_encoding_containers", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args:              Args{TopologyManagerPolicy: TMPolicySingleNUMANode},
+			topo:              &ghwtopology.Info{Nodes: []*ghwtopology.Node{{ID: 0}}},
+			coreIDToNodeIDMap: map[int]int{0: 0},
+		}
+		podRes := []*podresourcesapi.PodResources{
+			{
+				Namespace: "ns1",
+				Name:      "pod1",
+				Containers: []*podresourcesapi.ContainerResources{
+					{Name: "cnt1", CpuIds: []int64{0}},
+				},
+			},
+		}
+		got, err := rm.encodeContainerAffinities(podRes)
+		assert.NoError(t, err)
+		// encodeContainerAffinities returns enc.Result() immediately when len(topo.Nodes)==1,
+		// without iterating pod resources (no per-container placement on a single NUMA node).
+		want := numaplacement.Payload{
+			Containers:     0,
+			NUMANodes:      1,
+			BusiestNode:    0,
+			VectorEncoding: numaplacement.VectorEncodingLEB89,
+			Vectors:        map[int]string{},
+		}
+		assert.Empty(t, cmp.Diff(want, got))
+	})
+
+	t.Run("encodes_cpu_affinity", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args:              Args{TopologyManagerPolicy: TMPolicySingleNUMANode},
+			topo:              twoNUMANodesTopo(),
+			coreIDToNodeIDMap: map[int]int{0: 1},
+		}
+		podRes := []*podresourcesapi.PodResources{
+			{
+				Namespace: "ns1",
+				Name:      "pod1",
+				Containers: []*podresourcesapi.ContainerResources{
+					{Name: "cnt1", CpuIds: []int64{0}},
+				},
+			},
+		}
+		got, err := rm.encodeContainerAffinities(podRes)
+		assert.NoError(t, err)
+		want := numaplacement.Payload{
+			Containers:     1,
+			NUMANodes:      2,
+			BusiestNode:    1,
+			VectorEncoding: numaplacement.VectorEncodingLEB89,
+			Vectors:        map[int]string{},
+		}
+		assert.Empty(t, cmp.Diff(want, got))
+	})
+
+	t.Run("encodes_device_topology_when_no_cpus", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args:              Args{TopologyManagerPolicy: TMPolicySingleNUMANode},
+			topo:              twoNUMANodesTopo(),
+			coreIDToNodeIDMap: map[int]int{},
+		}
+		podRes := []*podresourcesapi.PodResources{
+			{
+				Namespace: "ns1",
+				Name:      "pod1",
+				Containers: []*podresourcesapi.ContainerResources{
+					{
+						Name: "cnt1",
+						Devices: []*podresourcesapi.ContainerDevices{
+							{
+								ResourceName: "fake.io/gpu",
+								DeviceIds:    []string{"gpu0"},
+								Topology: &podresourcesapi.TopologyInfo{
+									Nodes: []*podresourcesapi.NUMANode{{ID: 0}},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		got, err := rm.encodeContainerAffinities(podRes)
+		assert.NoError(t, err)
+		want := numaplacement.Payload{
+			Containers:     1,
+			NUMANodes:      2,
+			BusiestNode:    0,
+			VectorEncoding: numaplacement.VectorEncodingLEB89,
+			Vectors:        map[int]string{},
+		}
+		assert.Empty(t, cmp.Diff(want, got))
+	})
+
+	t.Run("encodes_memory_topology_when_no_cpus_or_devices", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args:              Args{TopologyManagerPolicy: TMPolicySingleNUMANode},
+			topo:              twoNUMANodesTopo(),
+			coreIDToNodeIDMap: map[int]int{},
+		}
+		podRes := []*podresourcesapi.PodResources{
+			{
+				Namespace: "ns1",
+				Name:      "pod1",
+				Containers: []*podresourcesapi.ContainerResources{
+					{
+						Name: "cnt1",
+						Memory: []*podresourcesapi.ContainerMemory{
+							{
+								MemoryType: "memory",
+								Size:       1024,
+								Topology: &podresourcesapi.TopologyInfo{
+									Nodes: []*podresourcesapi.NUMANode{{ID: 1}},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		got, err := rm.encodeContainerAffinities(podRes)
+		assert.NoError(t, err)
+		want := numaplacement.Payload{
+			Containers:     1,
+			NUMANodes:      2,
+			BusiestNode:    1,
+			VectorEncoding: numaplacement.VectorEncodingLEB89,
+			Vectors:        map[int]string{},
+		}
+		assert.Empty(t, cmp.Diff(want, got))
+	})
+
+	t.Run("multiple_pods_and_mixed_skip_encode", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args:              Args{TopologyManagerPolicy: TMPolicySingleNUMANode},
+			topo:              twoNUMANodesTopo(),
+			coreIDToNodeIDMap: map[int]int{0: 0, 1: 1},
+		}
+		podRes := []*podresourcesapi.PodResources{
+			{
+				Namespace: "ns1",
+				Name:      "pod-a",
+				Containers: []*podresourcesapi.ContainerResources{
+					{Name: "skip-me"},
+					{Name: "ok", CpuIds: []int64{0}},
+				},
+			},
+			{
+				Namespace: "ns2",
+				Name:      "pod-b",
+				Containers: []*podresourcesapi.ContainerResources{
+					{Name: "ok2", CpuIds: []int64{1}},
+				},
+			},
+		}
+		got, err := rm.encodeContainerAffinities(podRes)
+		assert.NoError(t, err)
+		want := numaplacement.Payload{
+			Containers:     2,
+			NUMANodes:      2,
+			BusiestNode:    0,
+			VectorEncoding: numaplacement.VectorEncodingLEB89,
+			Vectors:        map[int]string{1: "!"},
+		}
+		assert.Empty(t, cmp.Diff(want, got))
+	})
+
+	t.Run("encode_container_failure_numa_oob_is_silent_no_state_change", func(t *testing.T) {
+		rm := &resourceMonitor{
+			args:              Args{TopologyManagerPolicy: TMPolicySingleNUMANode},
+			topo:              twoNUMANodesTopo(),
+			coreIDToNodeIDMap: map[int]int{},
+		}
+		podRes := []*podresourcesapi.PodResources{
+			{
+				Namespace: "ns1",
+				Name:      "pod1",
+				Containers: []*podresourcesapi.ContainerResources{
+					{
+						Name: "cnt1",
+						Devices: []*podresourcesapi.ContainerDevices{
+							{
+								ResourceName: "fake.io/gpu",
+								DeviceIds:    []string{"gpu0"},
+								Topology: &podresourcesapi.TopologyInfo{
+									Nodes: []*podresourcesapi.NUMANode{{ID: 3}},
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		got, err := rm.encodeContainerAffinities(podRes)
+		assert.NoError(t, err)
+		want := numaplacement.Payload{
+			Containers:     0,
+			NUMANodes:      2,
+			BusiestNode:    0,
+			VectorEncoding: numaplacement.VectorEncodingLEB89,
+			Vectors:        map[int]string{},
+		}
+		assert.Empty(t, cmp.Diff(want, got))
+	})
+}
+
+func scanAttributeValue(attrs topologyv1alpha2.AttributeList, name string) (string, bool) {
+	for i := range attrs {
+		if attrs[i].Name == name {
+			return attrs[i].Value, true
+		}
+	}
+	return "", false
+}
+
+func zoneByName(zones topologyv1alpha2.ZoneList, name string) (topologyv1alpha2.Zone, bool) {
+	for i := range zones {
+		if zones[i].Name == name {
+			return zones[i], true
+		}
+	}
+	return topologyv1alpha2.Zone{}, false
+}
+
+// newResourceMonitorForNodeLevelScanTest is a shared helper function that builds the same monitor + mock used by Scan tests that exercise
+// pod fingerprint and numaplacement (testTopology, two NUMA, MethodAll, single-numa-node policy).
+func newResourceMonitorForNodeLevelScanTest(t *testing.T) (*resourceMonitor, *podres.MockPodResourcesListerClient) {
+	t.Helper()
+	fakeTopo := ghwtopology.Info{}
+	err := json.Unmarshal([]byte(testTopology), &fakeTopo)
+	assert.NoError(t, err)
+
+	allContainerDevices := []*v1.ContainerDevices{
+		{
+			ResourceName: "fake.io/net",
+			DeviceIds:    []string{"netAAA-0"},
+			Topology:     &v1.TopologyInfo{Nodes: []*v1.NUMANode{{ID: 0}}},
+		},
+		{
+			ResourceName: "fake.io/net",
+			DeviceIds:    []string{"netAAA-1"},
+			Topology:     &v1.TopologyInfo{Nodes: []*v1.NUMANode{{ID: 0}}},
+		},
+		{
+			ResourceName: "fake.io/net",
+			DeviceIds:    []string{"netAAA-2"},
+			Topology:     &v1.TopologyInfo{Nodes: []*v1.NUMANode{{ID: 0}}},
+		},
+		{
+			ResourceName: "fake.io/net",
+			DeviceIds:    []string{"netAAA-3"},
+			Topology:     &v1.TopologyInfo{Nodes: []*v1.NUMANode{{ID: 0}}},
+		},
+		{
+			ResourceName: "fake.io/net",
+			DeviceIds:    []string{"netBBB-0"},
+			Topology:     &v1.TopologyInfo{Nodes: []*v1.NUMANode{{ID: 1}}},
+		},
+		{
+			ResourceName: "fake.io/net",
+			DeviceIds:    []string{"netBBB-1"},
+			Topology:     &v1.TopologyInfo{Nodes: []*v1.NUMANode{{ID: 1}}},
+		},
+		{
+			ResourceName: "fake.io/gpu",
+			DeviceIds:    []string{"gpuAAA"},
+			Topology:     &v1.TopologyInfo{Nodes: []*v1.NUMANode{{ID: 1}}},
+		},
+	}
+
+	availRes := &v1.AllocatableResourcesResponse{
+		Devices: allContainerDevices,
+		CpuIds: []int64{
+			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+			12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+		},
+	}
+
+	mockPodResClient := new(podres.MockPodResourcesListerClient)
+	mockPodResClient.On("GetAllocatableResources", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.AllocatableResourcesRequest")).Return(availRes, nil)
+
+	args := Args{
+		PodSetFingerprint:       true,
+		PodSetFingerprintMethod: podfingerprint.MethodAll,
+		TopologyManagerPolicy:   TMPolicySingleNUMANode,
+	}
+	resMon, err := NewResourceMonitor(
+		Handle{PodResCli: mockPodResClient},
+		args,
+		WithNodeName("TEST"),
+		WithTopology(&fakeTopo),
+		WithK8sClient(fake.NewSimpleClientset()),
+	)
+	assert.NoError(t, err)
+	return resMon, mockPodResClient
+}
+
+// TestScan_NodeLevelAttributes checks ScanResponse.Attributes (node-level NRT attributes):
+// pod fingerprint + method and numaplacement metadata (PackMetadata).
+func TestScan_NodeLevelAttributes(t *testing.T) {
+	resMon, mockPodResClient := newResourceMonitorForNodeLevelScanTest(t)
+
+	listResp := &v1.ListPodResourcesResponse{
+		PodResources: []*v1.PodResources{
+			{
+				Namespace: "ns1",
+				Name:      "pod-a",
+				Containers: []*v1.ContainerResources{
+					{Name: "ok", CpuIds: []int64{0}},
+				},
+			},
+			{
+				Namespace: "ns2",
+				Name:      "pod-b",
+				Containers: []*v1.ContainerResources{
+					{Name: "ok2", CpuIds: []int64{1}},
+				},
+			},
+			{ // simulate best-effort pod's container
+				Namespace: "ns3",
+				Name:      "pod-c",
+				Containers: []*v1.ContainerResources{
+					{Name: "okforall-notexclusive"},
+				},
+			},
+		},
+	}
+	mockPodResClient.On("List", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.ListPodResourcesRequest")).Return(listResp, nil)
+
+	scanRes, err := resMon.Scan(ResourceExclude{})
+	assert.NoError(t, err)
+
+	// Node-level (ScanResponse.Attributes): pod fingerprint + method
+	fpVal, ok := scanAttributeValue(scanRes.Attributes, podfingerprint.Attribute)
+	assert.True(t, ok, "expected %q on scan attributes", podfingerprint.Attribute)
+	assert.True(t, strings.HasPrefix(fpVal, podfingerprint.Prefix+podfingerprint.Version),
+		"fingerprint value should start with prefix+version, got %q", fpVal)
+
+	methodVal, ok := scanAttributeValue(scanRes.Attributes, podfingerprint.AttributeMethod)
+	assert.True(t, ok, "expected %q on scan attributes", podfingerprint.AttributeMethod)
+	assert.Equal(t, podfingerprint.MethodAll, methodVal)
+
+	assert.Equal(t, fpVal, scanRes.Annotations[podfingerprint.Annotation])
+
+	metaVal, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
+	assert.True(t, ok, "expected %q on scan attributes", numaplacement.AttributeMetadata)
+	assert.True(t, strings.HasPrefix(metaVal, numaplacement.Prefix+numaplacement.Version),
+		"numaplacement metadata value should start with prefix+version, got %q", metaVal)
+
+	var unpacked numaplacement.Payload
+	assert.NoError(t, numaplacement.UnpackMetadataInto(&unpacked, metaVal))
+	assert.Equal(t, 2, unpacked.Containers) // nonexclusive containers are filtered out
+	assert.Equal(t, 2, unpacked.NUMANodes)
+	assert.Equal(t, numaplacement.VectorEncodingLEB89, unpacked.VectorEncoding)
+	assert.Equal(t, 0, unpacked.BusiestNode)
+	// UnpackMetadataInto only fills metadata fields (cc/nn/bn/ve); it does not populate Payload.Vectors.
+
+	//switch to exclusive resources method does not change the container finger print on NUMAs
+	resMon.args.PodSetFingerprintMethod = podfingerprint.MethodWithExclusiveResources
+	scanRes, err = resMon.Scan(ResourceExclude{})
+	assert.NoError(t, err)
+	methodVal, ok = scanAttributeValue(scanRes.Attributes, podfingerprint.AttributeMethod)
+	assert.True(t, ok, "expected %q on scan attributes", podfingerprint.AttributeMethod)
+	assert.Equal(t, podfingerprint.MethodWithExclusiveResources, methodVal)
+
+	fpValExclusiveOnly, ok := scanAttributeValue(scanRes.Attributes, podfingerprint.Attribute)
+	assert.True(t, ok, "expected %q on scan attributes", podfingerprint.Attribute)
+	assert.NotEqual(t, fpVal, fpValExclusiveOnly) // PFP changed, CFP did not
+
+
+	metaValExclusiveOnly, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
+	assert.True(t, ok, "expected %q on scan attributes", numaplacement.AttributeMetadata)
+	assert.Equal(t, metaVal, metaValExclusiveOnly)
+
+	mockPodResClient.AssertExpectations(t)
+}
+
+// TestScan_NumaplacementBusiestNodeMetadata runs two Scans against the same ResourceMonitor.
+// The PodResources mock always returns one shared *ListPodResourcesResponse; between scans the test
+// replaces PodResources to simulate a new kubelet List snapshot, so the second Scan sees a new busiest NUMA.
+func TestScan_NumaplacementBusiestNodeMetadata(t *testing.T) {
+	resMon, mockPodResClient := newResourceMonitorForNodeLevelScanTest(t)
+
+	// One container on NUMA 0 (CPU 0) and two on NUMA 1 (CPUs 1, 3) => NUMA 1 is busiest; vector only on NUMA 0.
+	listResp := &v1.ListPodResourcesResponse{
+		PodResources: []*v1.PodResources{
+			{
+				Namespace: "ns1",
+				Name:      "pod-a",
+				Containers: []*v1.ContainerResources{
+					{Name: "ok", CpuIds: []int64{0}},
+				},
+			},
+			{
+				Namespace: "ns2",
+				Name:      "pod-b",
+				Containers: []*v1.ContainerResources{
+					{Name: "ok2", CpuIds: []int64{1}},
+				},
+			},
+			{
+				Namespace: "ns2",
+				Name:      "pod-c",
+				Containers: []*v1.ContainerResources{
+					{Name: "ok3", CpuIds: []int64{3}},
+				},
+			},
+		},
+	}
+	mockPodResClient.On("List", mock.AnythingOfType("*context.timerCtx"), mock.AnythingOfType("*v1.ListPodResourcesRequest")).Return(listResp, nil).Times(2) // need to call twice to simulate the two scans
+
+	wantPl, err := resMon.encodeContainerAffinities(listResp.PodResources)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, wantPl.BusiestNode, "sanity: two containers on NUMA 1 vs one on NUMA 0")
+	assert.Contains(t, wantPl.Vectors, 0)
+	assert.NotContains(t, wantPl.Vectors, 1)
+
+	scanRes, err := resMon.Scan(ResourceExclude{})
+	assert.NoError(t, err)
+
+	metaVal, ok := scanAttributeValue(scanRes.Attributes, numaplacement.AttributeMetadata)
+	assert.True(t, ok, "expected %q on scan attributes", numaplacement.AttributeMetadata)
+	assert.True(t, strings.HasPrefix(metaVal, numaplacement.Prefix+numaplacement.Version),
+		"numaplacement metadata value should start with prefix+version, got %q", metaVal)
+	var unpacked numaplacement.Payload
+	assert.NoError(t, numaplacement.UnpackMetadataInto(&unpacked, metaVal))
+	assert.Equal(t, 3, unpacked.Containers)
+	assert.Equal(t, 1, unpacked.BusiestNode)
+
+	// Two containers on NUMA 0 (CPUs 0, 2) and one on NUMA 1 (CPU 1) => NUMA 0 is busiest; vector only on NUMA 1.
+	listResp.PodResources = []*v1.PodResources{
+		{
+			Namespace: "ns1",
+			Name:      "pod-a",
+			Containers: []*v1.ContainerResources{
+				{Name: "ok", CpuIds: []int64{0}},
+			},
+		},
+		{
+			Namespace: "ns1",
+			Name:      "pod-d",
+			Containers: []*v1.ContainerResources{
+				{Name: "ok4", CpuIds: []int64{2}},
+			},
+		},
+		{
+			Namespace: "ns2",
+			Name:      "pod-b",
+			Containers: []*v1.ContainerResources{
+				{Name: "ok2", CpuIds: []int64{1}},
+			},
+		},
+	}
+
+	wantPl2, err := resMon.encodeContainerAffinities(listResp.PodResources)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, wantPl2.BusiestNode, "sanity: two containers on NUMA 0 vs one on NUMA 1")
+	assert.Contains(t, wantPl2.Vectors, 1)
+	assert.NotContains(t, wantPl2.Vectors, 0)
+
+	scanRes2, err := resMon.Scan(ResourceExclude{})
+	assert.NoError(t, err)
+
+	metaVal2, ok := scanAttributeValue(scanRes2.Attributes, numaplacement.AttributeMetadata)
+	assert.True(t, ok, "expected %q on second scan", numaplacement.AttributeMetadata)
+	assert.True(t, strings.HasPrefix(metaVal2, numaplacement.Prefix+numaplacement.Version),
+		"numaplacement metadata value should start with prefix+version, got %q", metaVal2)
+	var unpacked2 numaplacement.Payload
+	assert.NoError(t, numaplacement.UnpackMetadataInto(&unpacked2, metaVal2))
+	assert.Equal(t, 3, unpacked2.Containers)
+	assert.Equal(t, 0, unpacked2.BusiestNode)
+
+	mockPodResClient.AssertExpectations(t)
 }
 
 // ghwc topology -f json
