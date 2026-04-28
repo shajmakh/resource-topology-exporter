@@ -96,6 +96,11 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 		ginkgo.It("[NotificationFile] it should react to pod changes using the smart poller with notification file", func() {
 			initialNodeTopo := e2enodetopology.GetNodeTopology(f.TopoCli, topologyUpdaterNode.Name)
 
+			updateInterval, method, err := estimateUpdateInterval(*initialNodeTopo)
+			gomega.Expect(err).ToNot(gomega.HaveOccurred())
+			baselineTimeout := 5*updateInterval + updateIntervalExtraSafety
+			klog.Infof("%s update interval: %s (timeout %s)", method, updateInterval, baselineTimeout)
+
 			ginkgo.By("waiting for a periodic update to find the optimal update window")
 			var baselineNodeTopo *v1alpha2.NodeResourceTopology
 			gomega.Eventually(func(g gomega.Gomega) {
@@ -104,7 +109,7 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 				g.Expect(err).ToNot(gomega.HaveOccurred(), "failed to get the node topology resource")
 				g.Expect(baselineNodeTopo.ObjectMeta.ResourceVersion).ToNot(gomega.Equal(initialNodeTopo.ObjectMeta.ResourceVersion), "resource %s not yet updated - resource version not bumped", topologyUpdaterNode.Name)
 				klog.Infof("resource %s baseline update (resource version %v -> %v)", topologyUpdaterNode.Name, initialNodeTopo.ObjectMeta.ResourceVersion, baselineNodeTopo.ObjectMeta.ResourceVersion)
-			}).WithTimeout(31*time.Second).WithPolling(1*time.Second).Should(gomega.Succeed(), "didn't get baseline periodic update")
+			}).WithTimeout(baselineTimeout).WithPolling(1*time.Second).Should(gomega.Succeed(), "didn't get baseline periodic update")
 
 			ginkgo.By("triggering notification using the file")
 			rtePod, err := e2epods.GetPodOnNode(f.K8SCli, topologyUpdaterNode.Name, e2etestenv.GetNamespaceName(), e2etestenv.RTELabelName)
@@ -133,7 +138,7 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 				reason, ok := finalNodeTopo.Annotations[k8sannotations.RTEUpdate]
 				g.Expect(ok).To(gomega.BeTrue(), "resource %s missing annotation!", topologyUpdaterNode.Name)
 				g.Expect(reason).To(gomega.Equal(nrtupdater.RTEUpdateReactive), "resource %s reason %v expected %v", topologyUpdaterNode.Name, reason, nrtupdater.RTEUpdateReactive)
-			}).WithTimeout(31*time.Second).WithPolling(1*time.Second).Should(gomega.Succeed(), "didn't get updated node topology info")
+			}).WithTimeout(baselineTimeout).WithPolling(1*time.Second).Should(gomega.Succeed(), "didn't get updated node topology info")
 
 			ginkgo.By("checking the topology was updated for the right reason")
 			gomega.Expect(finalNodeTopo.Annotations).ToNot(gomega.BeNil(), "missing annotations entirely")
