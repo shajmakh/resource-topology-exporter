@@ -22,8 +22,6 @@ package rte
 
 import (
 	"context"
-	"fmt"
-	"strings"
 	"time"
 
 	"github.com/onsi/ginkgo/v2"
@@ -100,17 +98,12 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 
 			ginkgo.By("waiting for a periodic update to find the optimal update window")
 			var baselineNodeTopo *v1alpha2.NodeResourceTopology
-			gomega.Eventually(func() error {
+			gomega.Eventually(func(g gomega.Gomega) {
 				var err error
 				baselineNodeTopo, err = f.TopoCli.TopologyV1alpha2().NodeResourceTopologies().Get(context.TODO(), topologyUpdaterNode.Name, metav1.GetOptions{})
-				if err != nil {
-					return fmt.Errorf("failed to get the node topology resource: %w", err)
-				}
-				if baselineNodeTopo.ObjectMeta.ResourceVersion == initialNodeTopo.ObjectMeta.ResourceVersion {
-					return fmt.Errorf("resource %s not yet updated - resource version not bumped", topologyUpdaterNode.Name)
-				}
+				g.Expect(err).ToNot(gomega.HaveOccurred(), "failed to get the node topology resource")
+				g.Expect(baselineNodeTopo.ObjectMeta.ResourceVersion).ToNot(gomega.Equal(initialNodeTopo.ObjectMeta.ResourceVersion), "resource %s not yet updated - resource version not bumped", topologyUpdaterNode.Name)
 				klog.Infof("resource %s baseline update (resource version %v -> %v)", topologyUpdaterNode.Name, initialNodeTopo.ObjectMeta.ResourceVersion, baselineNodeTopo.ObjectMeta.ResourceVersion)
-				return nil
 			}).WithTimeout(31*time.Second).WithPolling(1*time.Second).Should(gomega.Succeed(), "didn't get baseline periodic update")
 
 			ginkgo.By("triggering notification using the file")
@@ -130,25 +123,16 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 
 			ginkgo.By("waiting for reactive topology update")
 			var finalNodeTopo *v1alpha2.NodeResourceTopology
-			gomega.Eventually(func() error {
+			gomega.Eventually(func(g gomega.Gomega) {
 				finalNodeTopo, err = f.TopoCli.TopologyV1alpha2().NodeResourceTopologies().Get(context.TODO(), topologyUpdaterNode.Name, metav1.GetOptions{})
-				if err != nil {
-					return fmt.Errorf("failed to get the node topology resource: %w", err)
-				}
-				if finalNodeTopo.ObjectMeta.ResourceVersion == baselineNodeTopo.ObjectMeta.ResourceVersion {
-					return fmt.Errorf("resource %s not yet updated - resource version not bumped", topologyUpdaterNode.Name)
-				}
+				g.Expect(err).ToNot(gomega.HaveOccurred(), "failed to get the node topology resource")
+				g.Expect(finalNodeTopo.ObjectMeta.ResourceVersion).ToNot(gomega.Equal(baselineNodeTopo.ObjectMeta.ResourceVersion), "resource %s not yet updated - resource version not bumped", topologyUpdaterNode.Name)
 
 				klog.Infof("resource %s updated! - resource version bumped (old %v new %v)", topologyUpdaterNode.Name, baselineNodeTopo.ObjectMeta.ResourceVersion, finalNodeTopo.ObjectMeta.ResourceVersion)
 
 				reason, ok := finalNodeTopo.Annotations[k8sannotations.RTEUpdate]
-				if !ok {
-					return fmt.Errorf("resource %s missing annotation!", topologyUpdaterNode.Name)
-				}
-				if reason != nrtupdater.RTEUpdateReactive {
-					return fmt.Errorf("resource %s reason %v expected %v", topologyUpdaterNode.Name, reason, nrtupdater.RTEUpdateReactive)
-				}
-				return nil
+				g.Expect(ok).To(gomega.BeTrue(), "resource %s missing annotation!", topologyUpdaterNode.Name)
+				g.Expect(reason).To(gomega.Equal(nrtupdater.RTEUpdateReactive), "resource %s reason %v expected %v", topologyUpdaterNode.Name, reason, nrtupdater.RTEUpdateReactive)
 			}).WithTimeout(31*time.Second).WithPolling(1*time.Second).Should(gomega.Succeed(), "didn't get updated node topology info")
 
 			ginkgo.By("checking the topology was updated for the right reason")
@@ -272,18 +256,19 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 	})
 	ginkgo.Context("with refresh-node-resources enabled", func() {
 		ginkgo.It("[NodeRefresh] should be able to detect devices", func() {
-			gomega.Eventually(func() bool {
+			gomega.Eventually(func(g gomega.Gomega) {
 				nrt := e2enodetopology.GetNodeTopology(f.TopoCli, topologyUpdaterNode.Name)
 				devName := e2etestenv.GetDeviceName()
+				found := false
 				for _, zone := range nrt.Zones {
 					for _, res := range zone.Resources {
 						if res.Name == devName {
-							return true
+							found = true
 						}
 					}
 				}
-				return false
-			}).WithTimeout(30*time.Second).WithPolling(10*time.Second).Should(gomega.BeTrue(), "device: %q was not found in NRT: %q", e2etestenv.GetDeviceName(), topologyUpdaterNode.Name)
+				g.Expect(found).To(gomega.BeTrue(), "device: %q was not found in NRT: %q", devName, topologyUpdaterNode.Name)
+			}).WithTimeout(30 * time.Second).WithPolling(10 * time.Second).Should(gomega.Succeed())
 		})
 
 		ginkgo.It("[NodeRefresh] should log the refresh message", func() {
@@ -293,12 +278,15 @@ var _ = ginkgo.Describe("[RTE][InfraConsuming] Resource topology exporter", func
 			rteContainerName, err := e2ertepod.FindRTEContainerName(rtePod)
 			gomega.Expect(err).ToNot(gomega.HaveOccurred())
 
-			gomega.Eventually(func() bool {
+			gomega.Eventually(func(g gomega.Gomega) {
 				logs, err := e2epods.GetLogsForPod(f.K8SCli, rtePod.Namespace, rtePod.Name, rteContainerName)
-				gomega.Expect(err).ToNot(gomega.HaveOccurred())
+				g.Expect(err).ToNot(gomega.HaveOccurred())
 
-				return strings.Contains(logs, "tracking node resources") || strings.Contains(logs, "update node resources")
-			}).WithTimeout(42*time.Second).WithPolling(5*time.Second).Should(gomega.BeTrue(), "container: %q in pod: %q doesn't contains the refresh log message", rteContainerName, rtePod.Name)
+				g.Expect(logs).To(gomega.Or(
+					gomega.ContainSubstring("tracking node resources"),
+					gomega.ContainSubstring("update node resources"),
+				), "container: %q in pod: %q doesn't contain the refresh log message", rteContainerName, rtePod.Name)
+			}).WithTimeout(42 * time.Second).WithPolling(5 * time.Second).Should(gomega.Succeed())
 		})
 	})
 })
@@ -309,15 +297,10 @@ func getUpdatedNRT(topologyClient *topologyclientset.Clientset, nodeName string,
 	klog.Infof("waiting for NRT %q update: timeout %v (base %v + safety %v) prev resourceVersion=%v", nodeName, effectiveTimeout, timeout, updateIntervalExtraSafety, prevNrt.ObjectMeta.ResourceVersion)
 	var err error
 	var currNrt *v1alpha2.NodeResourceTopology
-	gomega.Eventually(func() error {
+	gomega.Eventually(func(g gomega.Gomega) {
 		currNrt, err = topologyClient.TopologyV1alpha2().NodeResourceTopologies().Get(context.TODO(), nodeName, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to get the node topology resource: %w", err)
-		}
-		if currNrt.ObjectMeta.ResourceVersion == prevNrt.ObjectMeta.ResourceVersion {
-			return fmt.Errorf("resource %s not yet updated - resource version not bumped", nodeName)
-		}
-		return nil
+		g.Expect(err).ToNot(gomega.HaveOccurred(), "failed to get the node topology resource")
+		g.Expect(currNrt.ObjectMeta.ResourceVersion).ToNot(gomega.Equal(prevNrt.ObjectMeta.ResourceVersion), "resource %s not yet updated - resource version not bumped", nodeName)
 	}).WithTimeout(effectiveTimeout).WithPolling(1*time.Second).Should(gomega.Succeed(), "didn't get updated node topology info")
 	return currNrt
 }

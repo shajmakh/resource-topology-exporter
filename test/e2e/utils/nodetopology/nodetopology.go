@@ -52,18 +52,12 @@ func GetNodeTopologyWithResource(topologyClient *topologyclientset.Clientset, no
 
 	var nodeTopology *v1alpha2.NodeResourceTopology
 	var err error
-	gomega.Eventually(func() error {
+	gomega.Eventually(func(g gomega.Gomega) {
 		nodeTopology, err = topologyClient.TopologyV1alpha2().NodeResourceTopologies().Get(context.TODO(), nodeName, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to get the node topology resource: %w", err)
+		g.Expect(err).ToNot(gomega.HaveOccurred(), "failed to get the node topology resource")
+		if resName != "" {
+			g.Expect(containsResource(nodeTopology, resName)).To(gomega.BeTrue(), "the node topology data doesn't include resource %q", resName)
 		}
-		if resName == "" {
-			return nil // legit case
-		}
-		if !containsResource(nodeTopology, resName) {
-			return fmt.Errorf("the node topology data doesn't include resource %q", resName)
-		}
-		return nil
 	}).WithTimeout(time.Minute).WithPolling(5 * time.Second).Should(gomega.Succeed())
 
 	return nodeTopology
