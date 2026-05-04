@@ -23,7 +23,7 @@ all: build
 build-tools: outdir _out/git-semver
 
 .PHONY: extra-tools
-extra-tools: outdir _out/nrtstress
+extra-tools: outdir _out/nrtstress _out/nrt-container-numa
 
 .PHONY: build
 build: build-rte
@@ -139,6 +139,10 @@ update-golden-files:
 _out/nrtstress: outdir
 	$(COMMONENVVAR) $(BUILDENVVAR) go build \
 	-o _out/nrtstress tools/nrtstress/main.go
+
+_out/nrt-container-numa: outdir
+	$(COMMONENVVAR) $(BUILDENVVAR) go build \
+	-o _out/nrt-container-numa tools/nrt-container-numa/main.go
 
 # build tools:
 _out/golangci-lint: outdir
