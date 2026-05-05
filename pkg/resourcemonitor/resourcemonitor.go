@@ -27,6 +27,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/k8stopologyawareschedwg/numaplacement"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -52,6 +54,8 @@ import (
 const (
 	defaultPodResourcesTimeout = 10 * time.Second
 	// obtained these values from node e2e tests : https://github.com/kubernetes/kubernetes/blob/82baa26905c94398a0d19e1b1ecf54eb8acb6029/test/e2e_node/util.go#L70
+
+	TopologyManagerPolicySingleNUMANode = "single-numa-node"
 )
 
 type ResourceExclude map[string][]string
@@ -292,6 +296,19 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		klog.V(6).Infof("resmon: pfp: %s", st.Repr())
 
 		podfingerprint.MarkCompleted(st)
+
+		metadataAttValue := ""
+		payload, err := rm.computeNUMAPlacementPayload(pfpPodRes)
+		if err != nil {
+			klog.V(2).ErrorS(err, "resmon: failed to encode container affinities")
+		} else {
+			metadataAttValue = payload.PackMetadata()
+		}
+
+		scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
+			Name:  numaplacement.AttributeMetadata,
+			Value: metadataAttValue,
+		})
 	}
 
 	allDevs := GetAllContainerDevices(respPodRes, rm.args.Namespace, rm.coreIDToNodeIDMap)
@@ -457,6 +474,45 @@ func (rm *resourceMonitor) updateNodeResources() error {
 	// hence, initialize capacity as allocatable
 	rm.updateDevicesCapacity()
 	return nil
+}
+
+func (rm *resourceMonitor) computeNUMAPlacementPayload(podRes []*podresourcesapi.PodResources) (numaplacement.Payload, error) {
+	if rm.args.TopologyManagerPolicy != TopologyManagerPolicySingleNUMANode {
+		klog.Infof("resmon: topology manager policy is not single-numa-node, skipping container NUMA affinity encoding")
+		return numaplacement.Payload{}, nil
+	}
+
+	if len(podRes) == 0 {
+		klog.Infof("resmon: zero filtered pod resources, skipping container NUMA affinity encoding")
+		return numaplacement.Payload{}, nil
+	}
+
+	enc, err := numaplacement.NewEncoder(len(rm.topo.Nodes))
+	if err != nil {
+		return numaplacement.Payload{}, fmt.Errorf("error creating encoder: %w", err)
+	}
+
+	if len(rm.topo.Nodes) == 1 {
+		return enc.Result()
+	}
+
+	for _, pr := range podRes {
+		for _, cnt := range pr.Containers {
+			eligibleForPlacement, numaNodeID, err := numalocality.ResolveContainerPlacement(rm.coreIDToNodeIDMap, cnt)
+			if !eligibleForPlacement {
+				continue
+			}
+
+			if err != nil || numaNodeID == -1 {
+				return numaplacement.Payload{}, fmt.Errorf("failed to find NUMA node for container with exclusive resources %s. numaNodeID: %d, err: %v", cnt.Name, numaNodeID, err)
+			}
+
+			enc.EncodeContainer(pr.Namespace, pr.Name, cnt.Name, numaNodeID)
+			klog.V(6).InfoS("resmon: encoded container NUMA affinity", "container", pr.Namespace+"/"+pr.Name+"/"+cnt.Name, "numaNodeID", numaNodeID)
+		}
+	}
+	return enc.Result()
+
 }
 
 func computePodFingerprintFromPodResources(podRes []*podresourcesapi.PodResources, st *podfingerprint.Status) string {
