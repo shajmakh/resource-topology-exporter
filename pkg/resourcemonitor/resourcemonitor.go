@@ -276,7 +276,10 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		if rm.args.PodSetFingerprintMethod == podfingerprint.MethodAll {
 			podresVerify = podresfilter.VerifyAlwaysPass
 		}
-		pfpSign := computePodFingerprintFromPodResources(respPodRes, &st, podresVerify)
+
+		pfpPodRes := podresfilter.Apply(respPodRes, podresVerify)
+
+		pfpSign := computePodFingerprintFromPodResources(pfpPodRes, &st)
 		scanRes.Attributes = append(scanRes.Attributes, topologyv1alpha2.AttributeInfo{
 			Name:  podfingerprint.Attribute,
 			Value: pfpSign,
@@ -456,13 +459,9 @@ func (rm *resourceMonitor) updateNodeResources() error {
 	return nil
 }
 
-func computePodFingerprintFromPodResources(podRes []*podresourcesapi.PodResources, st *podfingerprint.Status, verifyFunc func(*podresourcesapi.PodResources) podresfilter.Result) string {
+func computePodFingerprintFromPodResources(podRes []*podresourcesapi.PodResources, st *podfingerprint.Status) string {
 	fp := podfingerprint.NewTracingFingerprint(len(podRes), st)
 	for _, pr := range podRes {
-		res := verifyFunc(pr)
-		if !res.Allow {
-			continue
-		}
 		_ = fp.AddPod(pr)
 	}
 	return fp.Sign()
@@ -499,18 +498,6 @@ func GetAllContainerDevices(podRes []*podresourcesapi.PodResources, namespace st
 		}
 	}
 	return allCntRes
-}
-
-// ComputePodFingerprint is deprecated and will be unexported in a future version
-func ComputePodFingerprint(podRes []*podresourcesapi.PodResources, st *podfingerprint.Status, allowFilter func(*podresourcesapi.PodResources) bool) string {
-	fp := podfingerprint.NewTracingFingerprint(len(podRes), st)
-	for _, pr := range podRes {
-		if !allowFilter(pr) {
-			continue
-		}
-		_ = fp.AddPod(pr)
-	}
-	return fp.Sign()
 }
 
 func NormalizeContainerDevices(lh klog.Verbose, devices []*podresourcesapi.ContainerDevices, memoryBlocks []*podresourcesapi.ContainerMemory, cpuIds []int64, coreIDToNodeIDMap map[int]int) []*podresourcesapi.ContainerDevices {

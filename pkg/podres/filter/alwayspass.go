@@ -37,3 +37,14 @@ func AlwaysPass(pr *podresourcesapi.PodResources) bool {
 	ret := VerifyAlwaysPass(pr)
 	return ret.Allow
 }
+
+func Apply(podRes []*podresourcesapi.PodResources, verifyFunc func(*podresourcesapi.PodResources) Result) []*podresourcesapi.PodResources {
+	res := []*podresourcesapi.PodResources{}
+	for _, pr := range podRes {
+		if !verifyFunc(pr).Allow {
+			continue
+		}
+		res = append(res, pr)
+	}
+	return res
+}
