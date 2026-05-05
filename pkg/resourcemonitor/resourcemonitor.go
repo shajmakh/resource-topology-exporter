@@ -75,6 +75,7 @@ type Args struct {
 	PodSetFingerprintStatusFile string          `json:"podSetFingerprintStatusFile,omitempty"`
 	PodExclude                  podexclude.List `json:"podExclude,omitempty"`
 	ExcludeTerminalPods         bool            `json:"excludeTerminalPods,omitempty"`
+	TopologyManagerPolicy       string          `json:"topologyManagerPolicy,omitempty"`
 }
 
 func (args Args) Clone() Args {
