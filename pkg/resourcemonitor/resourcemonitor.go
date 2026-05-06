@@ -275,6 +275,7 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		Annotations: map[string]string{},
 	}
 
+	payload := numaplacement.Payload{}
 	if rm.args.PodSetFingerprint {
 		podresVerify := numalocality.Verify
 		if rm.args.PodSetFingerprintMethod == podfingerprint.MethodAll {
@@ -298,7 +299,7 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 		podfingerprint.MarkCompleted(st)
 
 		metadataAttValue := ""
-		payload, err := rm.computeNUMAPlacementPayload(pfpPodRes)
+		payload, err = rm.computeNUMAPlacementPayload(pfpPodRes)
 		if err != nil {
 			klog.V(2).ErrorS(err, "resmon: failed to encode container affinities")
 		} else {
@@ -323,6 +324,16 @@ func (rm *resourceMonitor) Scan(excludeList ResourceExclude) (ScanResponse, erro
 			Name:      makeZoneName(nodeID),
 			Type:      "Node",
 			Resources: make(topologyv1alpha2.ResourceInfoList, 0),
+		}
+
+		if payload.NUMANodes > 0 {
+			zoneVector, ok := payload.Vectors[nodeID]
+			if ok {
+				zone.Attributes = append(zone.Attributes, topologyv1alpha2.AttributeInfo{
+					Name:  numaplacement.AttributeVector,
+					Value: zoneVector,
+				})
+			}
 		}
 
 		costs, err := makeCostsPerNumaNode(rm.topo.Nodes, nodeID)
